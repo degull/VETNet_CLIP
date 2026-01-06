@@ -84,7 +84,7 @@ class DecoderStage(nn.Module):
 
 
 # ============================================================
-# VETNet Backbone (FiLM + Stage Gate)
+# VETNet Backbone (FiLM + Stage Gate + Spatial Gate)
 # ============================================================
 
 class VETNetBackbone(nn.Module):
@@ -202,11 +202,12 @@ class VETNetBackbone(nn.Module):
     # Forward
     # ============================================================
 
-    def forward(self, x, g_stage=None, film=None):
+    def forward(self, x, g_stage=None, film=None, spatial_gate=None):
         """
-        x       : [B,3,H,W]
-        g_stage : [B,8] or None
-        film    : {"gammas":[8], "betas":[8]} or None
+        x            : [B,3,H,W]
+        g_stage      : [B,8] or None
+        film         : {"gammas":[8], "betas":[8]} or None
+        spatial_gate : [B,1,H,W] or None
         """
         B = x.size(0)
         device, dtype = x.device, x.dtype
@@ -217,7 +218,12 @@ class VETNetBackbone(nn.Module):
         gammas = film["gammas"] if film is not None else [None] * 8
         betas  = film["betas"]  if film is not None else [None] * 8
 
+        # ---------------- Patch Embed ----------------
         x0 = self.patch_embed(x)
+
+        # ✅ Spatial Gate (encoder input)
+        if spatial_gate is not None:
+            x0 = x0 * spatial_gate
 
         # ---------------- Encoder ----------------
         e1 = self.encoder1(x0, gammas[0], betas[0])
@@ -283,9 +289,11 @@ if __name__ == "__main__":
                   for c in [64, 128, 256, 512, 256, 128, 64, 64]],
     }
 
+    spatial = torch.rand(2, 1, 256, 256, device=device)
+
     with torch.no_grad():
         y0 = model(x)
-        y1 = model(x, g_stage=g, film=film)
+        y1 = model(x, g_stage=g, film=film, spatial_gate=spatial)
 
     print("Output:", y0.shape, y1.shape,
           "Mean|diff|:", (y0 - y1).abs().mean().item())

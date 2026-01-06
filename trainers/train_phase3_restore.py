@@ -1,48 +1,55 @@
 # ============================================================
-# Phase-3: Restoration-aware Training (Final)
-# - Teacher: Phase-2 GateController (CLIP e_img -> g_phase2), frozen (teacher only)
-# - Student: DegradationEstimator D(x) + ConditionTranslator T(e_clip ⊕ v_deg) -> (film, g)
-# - Backbone: VETNetBackbone, (default: finetune for practical final training)
+# Phase-3: Restoration-aware Training (FINAL) + Metrics + Preview
 #
-# Loss (FIXED):
-#   L = L_restoration + lambda_g * |g - g_phase2|_1
+# 1) Gate distillation (Phase-2 → Phase-3)  [DEFAULT ON]
+# 2) FiLM ablation: stage-scalar / channel-wise
+# 3) Spatial gate from M(x) (raindrop / snow)
 #
-# Notes:
-# - BLIP captions are NOT used here.
-# - Inference remains text-free: uses CLIP image encoder + D(x) + translator.
+# + PSNR/SSIM logging (iter + epoch)
+# + Preview saving: (Distorted | Restored | GT) in ONE image
+#
+# Text-free inference guaranteed.
 # ============================================================
 
-import os
-import sys
-import time
-import math
-import json
-import random
-import datetime
+import os, sys, math, datetime
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Optional, List, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# (metrics + saving)
+try:
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
+
+try:
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+    _HAS_SKIMAGE = True
+except Exception:
+    _HAS_SKIMAGE = False
+
 
 # ------------------------------------------------------------
-# ROOT for imports
+# ROOT
 # ------------------------------------------------------------
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from models.backbone.vetnet_backbone import VETNetBackbone
-from models.controller.gate_controller import GateController
 from models.degradation.degradation_estimator import DegradationEstimator
-from models.controller.condition_translator import ConditionTranslator
+from models.controller.condition_translator import (
+    ConditionTranslator,
+    ConditionTranslatorConfig,
+)
 from datasets.multitask_clip_cache import MultiTaskCLIPCacheDataset
-
 
 # ============================================================
 # Config
@@ -50,540 +57,510 @@ from datasets.multitask_clip_cache import MultiTaskCLIPCacheDataset
 
 @dataclass
 class Config:
-    # cache root includes per-dataset folders:
-    # preload_cache/<DS>/clip_image_embeddings.pt
     cache_root: str = "E:/VETNet_CLIP/preload_cache"
-
-    # Phase-1 backbone ckpt (starting point)
     backbone_ckpt: str = "E:/VETNet_CLIP/checkpoints/phase1_backbone/epoch_021_L0.0204_P31.45_S0.9371.pth"
-
-    # Phase-2 gate teacher ckpt directory (contains epoch_XXX.pth)
     phase2_gate_ckpt_dir: str = "E:/VETNet_CLIP/checkpoints/phase2_gate"
 
-    # outputs
+    # checkpoints
     save_root: str = "E:/VETNet_CLIP/checkpoints/phase3_restore"
+    # previews
     results_root: str = "E:/VETNet_CLIP/results/phase3_restore"
 
-    # training
-    epochs: int = 50
+    epochs: int = 150
     batch_size: int = 2
     num_workers: int = 0
+
     lr_backbone: float = 5e-5
-    lr_controller: float = 2e-4
+    lr_ctrl: float = 2e-4
     weight_decay: float = 0.0
 
-    # crop
     crop_size: int = 256
-
-    # Loss fixed
-    lambda_g: float = 0.10  # gate distill weight
-
-    # AMP
-    use_amp: bool = True
-
-    # finetune options (practical)
-    freeze_backbone: bool = False     # practical default = finetune backbone
-    freeze_degradation: bool = False  # train D(x)
-    freeze_translator: bool = False   # train translator
-    # teacher is always frozen
-
-    # log / save
-    log_every: int = 50
-    save_every_epochs: int = 1
-    eval_images_per_batch: int = 1   # quick PSNR/SSIM trend
-
-    # datasets config (must match your preload_cache subfolders)
-    datasets_cfg: Dict[str, Dict[str, str]] = None
-
-    # stage count (fixed)
     num_stages: int = 8
+
+    # (name -> cfg dict). If None, auto-detect from cache_root
+    datasets_cfg: Optional[Dict[str, Dict]] = None
+
+    # gate distill
+    lambda_g: float = 0.1
+    lambda_warmup: int = 10
+
+    # ---- ablation switches ----
+    enable_film: bool = False
+    film_mode: str = "stage_scalar"   # "stage_scalar" | "stage_channel"
+    enable_spatial_gate: bool = False # M(x) → G_s
+
+    # ---- training ----
+    use_amp: bool = True
+    grad_clip: float = 1.0
+
+    # debug / safety
+    strict_cache_check: bool = True   # True: raise if missing pt, False: skip dataset
+
+    # ---- logging / preview ----
+    log_every: int = 200            # print metrics every N iterations
+    preview_every: int = 500        # save (input|output|gt) every N iterations
+    preview_max_items: int = 1      # number of samples per preview image (keep 1 to avoid too many files)
+
+    # normalization assumption
+    assume_0_1: bool = True         # if True, clamp to [0,1] for metrics/save
 
 
 cfg = Config()
-if cfg.datasets_cfg is None:
-    cfg.datasets_cfg = {
-        "CSD": {"task": "desnow"},
-        "DayRainDrop": {"task": "deraindrop"},
-        "NightRainDrop": {"task": "deraindrop"},
-        "rain100H": {"task": "derain"},
-        "rain100L": {"task": "derain"},
-        "RESIDE-6K": {"task": "dehaze"},
-    }
 
+# Prefer explicit list you provided (stable & reproducible).
+cfg.datasets_cfg = {
+    "CSD": {},
+    "DayRainDrop": {},
+    "NightRainDrop": {},
+    "rain100H": {},
+    "rain100L": {},
+    "RESIDE-6K": {},
+}
 
 # ============================================================
-# Utilities
+# Utils
 # ============================================================
 
-def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+def ramp_lambda(epoch: int) -> float:
+    if epoch <= 1:
+        return 0.0
+    if epoch >= cfg.lambda_warmup:
+        return cfg.lambda_g
+    return cfg.lambda_g * (epoch - 1) / (cfg.lambda_warmup - 1)
 
-class TeeLogger:
-    def __init__(self, log_path: str):
-        _ensure_dir(os.path.dirname(log_path))
-        self.fp = open(log_path, "w", encoding="utf-8", buffering=1)
-        self._stdout = sys.stdout
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-    def write(self, msg: str):
-        self._stdout.write(msg)
-        self.fp.write(msg)
+def _pick_latest_file(folder: str) -> str:
+    files = [os.path.join(folder, f) for f in os.listdir(folder)]
+    files = [f for f in files if os.path.isfile(f)]
+    if len(files) == 0:
+        raise FileNotFoundError(f"No checkpoint files found in: {folder}")
+    return max(files, key=os.path.getmtime)
 
-    def flush(self):
-        self._stdout.flush()
-        self.fp.flush()
+def _validate_cache_root(cache_root: str, datasets_cfg: Dict[str, Dict], strict: bool = True) -> Dict[str, Dict]:
+    """
+    Ensures each dataset folder exists and contains clip_image_embeddings.pt.
+    If strict=False, datasets missing the pt file are skipped.
+    """
+    ok = {}
+    missing = []
+    for name, dc in datasets_cfg.items():
+        droot = os.path.join(cache_root, name)
+        clip_pt = os.path.join(droot, "clip_image_embeddings.pt")
+        if not os.path.isdir(droot):
+            missing.append((name, f"missing folder: {droot}"))
+            continue
+        if not os.path.exists(clip_pt):
+            missing.append((name, f"missing file: {clip_pt}"))
+            continue
+        ok[name] = dc
 
-    def close(self):
-        try:
-            self.fp.close()
-        except:
-            pass
+    if len(missing) > 0:
+        msg = "\n".join([f"- {n}: {why}" for (n, why) in missing])
+        if strict:
+            raise FileNotFoundError(
+                "[CacheCheck] Some datasets are missing required cache files:\n"
+                f"{msg}\n\n"
+                "Fix: generate clip_image_embeddings.pt for those datasets OR remove them from cfg.datasets_cfg."
+            )
+        else:
+            print("[CacheCheck] Skipping missing datasets:\n" + msg)
 
+    if len(ok) == 0:
+        raise RuntimeError("[CacheCheck] No valid cached datasets found. Nothing to train on.")
+    return ok
 
-def compute_psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    mse = F.mse_loss(pred, gt).item()
-    if mse <= 1e-12:
-        return 99.0
-    return 10.0 * math.log10(1.0 / mse)
+def _to_01(x: torch.Tensor) -> torch.Tensor:
+    # We assume cache images are already in [0,1]. Clamp for safety.
+    if cfg.assume_0_1:
+        return x.clamp(0, 1)
+    return x
 
+def _calc_psnr_ssim_batch(pred: torch.Tensor, gt: torch.Tensor) -> Tuple[float, float]:
+    """
+    pred, gt: [B,3,H,W] in [0,1]
+    returns: (psnr_mean, ssim_mean)
+    """
+    if not _HAS_SKIMAGE:
+        return float("nan"), float("nan")
 
-def compute_ssim_simple(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    # lightweight SSIM-ish proxy (trend only)
-    x = pred.detach().float().clamp(0, 1)
-    y = gt.detach().float().clamp(0, 1)
-    mu_x = x.mean().item()
-    mu_y = y.mean().item()
-    var_x = x.var(unbiased=False).item()
-    var_y = y.var(unbiased=False).item()
-    cov = ((x - x.mean()) * (y - y.mean())).mean().item()
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-    ssim = ((2 * mu_x * mu_y + C1) * (2 * cov + C2)) / ((mu_x**2 + mu_y**2 + C1) * (var_x + var_y + C2) + 1e-12)
-    return float(ssim)
+    pred = _to_01(pred).detach().cpu().numpy()
+    gt   = _to_01(gt).detach().cpu().numpy()
 
+    psnr_list, ssim_list = [], []
+    for p, g in zip(pred, gt):
+        p = p.transpose(1, 2, 0)
+        g = g.transpose(1, 2, 0)
+        psnr_list.append(peak_signal_noise_ratio(g, p, data_range=1.0))
+        ssim_list.append(structural_similarity(g, p, channel_axis=2, data_range=1.0))
+    return float(sum(psnr_list) / len(psnr_list)), float(sum(ssim_list) / len(ssim_list))
 
-def find_latest_epoch_ckpt(ckpt_dir: str) -> Optional[str]:
-    if not os.path.isdir(ckpt_dir):
-        return None
-    best_ep = -1
-    best_path = None
-    for fn in os.listdir(ckpt_dir):
-        if fn.startswith("epoch_") and fn.endswith(".pth"):
-            try:
-                ep = int(fn.split("_")[1].split(".")[0])
-            except:
-                continue
-            if ep > best_ep:
-                best_ep = ep
-                best_path = os.path.join(ckpt_dir, fn)
-    return best_path
+def _tensor_to_pil(img3chw: torch.Tensor) -> "Image.Image":
+    """
+    img3chw: [3,H,W] float in [0,1]
+    """
+    assert _HAS_PIL, "PIL not available"
+    img = _to_01(img3chw).detach().cpu()
+    img = (img * 255.0).round().byte()
+    img = img.permute(1, 2, 0).numpy()  # HWC
+    return Image.fromarray(img)
 
-
-def load_backbone_ckpt(backbone: nn.Module, ckpt_path: str):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    backbone.load_state_dict(state_dict, strict=True)
-
-
-def save_phase3_ckpt(
-    path: str,
-    epoch: int,
-    backbone: nn.Module,
-    degrader: nn.Module,
-    translator: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler_state: Optional[dict],
-    extra: Dict[str, Any],
+def _save_triplet_side_by_side(
+    x: torch.Tensor, y_hat: torch.Tensor, y: torch.Tensor,
+    save_path: str,
+    title: Optional[str] = None
 ):
-    _ensure_dir(os.path.dirname(path))
-    torch.save(
-        {
-            "epoch": epoch,
-            "backbone": backbone.state_dict(),
-            "degradation_estimator": degrader.state_dict(),
-            "condition_translator": translator.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler_state,
-            "extra": extra,
-        },
-        path
-    )
+    """
+    Save ONE image: [input | output | gt] side-by-side for first sample in batch.
+    """
+    if not _HAS_PIL:
+        return
 
+    x0 = _tensor_to_pil(x[0])
+    o0 = _tensor_to_pil(y_hat[0])
+    y0 = _tensor_to_pil(y[0])
 
-def try_resume_phase3(
-    ckpt_dir: str,
-    backbone: nn.Module,
-    degrader: nn.Module,
-    translator: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[torch.cuda.amp.GradScaler],
-) -> int:
-    latest = find_latest_epoch_ckpt(ckpt_dir)
-    if latest is None:
-        return 1
-    ckpt = torch.load(latest, map_location="cpu")
-    backbone.load_state_dict(ckpt["backbone"], strict=True)
-    degrader.load_state_dict(ckpt["degradation_estimator"], strict=True)
-    translator.load_state_dict(ckpt["condition_translator"], strict=True)
-    if "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler", None) is not None:
-        try:
-            scaler.load_state_dict(ckpt["scaler"])
-        except:
-            pass
-    start_epoch = int(ckpt.get("epoch", 0)) + 1
-    print(f"[RESUME] Loaded: {latest}")
-    print(f"[RESUME] Start from epoch {start_epoch}")
-    return start_epoch
+    w, h = x0.size
+    canvas = Image.new("RGB", (w * 3, h), (0, 0, 0))
+    canvas.paste(x0, (0, 0))
+    canvas.paste(o0, (w, 0))
+    canvas.paste(y0, (w * 2, 0))
 
+    if title is not None:
+        draw = ImageDraw.Draw(canvas)
+        # Minimal overlay (avoid font dependency issues)
+        draw.rectangle([0, 0, w * 3, 20], fill=(0, 0, 0))
+        draw.text((6, 2), title, fill=(255, 255, 255))
+
+        # labels
+        draw.text((6, 22), "Input", fill=(255, 255, 255))
+        draw.text((w + 6, 22), "Restored", fill=(255, 255, 255))
+        draw.text((w * 2 + 6, 22), "GT", fill=(255, 255, 255))
+
+    _ensure_dir(os.path.dirname(save_path))
+    canvas.save(save_path)
 
 # ============================================================
-# Build models
+# Teacher (Phase-2 gate oracle)
 # ============================================================
 
-def build_teacher_gate_controller(clip_dim: int, num_stages: int, device: str) -> GateController:
-    """
-    Teacher only:
-    - load Phase-2 ckpt
-    - frozen
-    """
-    teacher = GateController(
-        in_dim=clip_dim,
-        num_stages=num_stages,
-        hidden_dim=512,
-    ).to(device)
+class GateTeacher(nn.Module):
+    def __init__(self, dims: List[int]):
+        super().__init__()
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i+1]))
+            if i != len(dims) - 2:
+                layers.append(nn.GELU())
+        self.mlp = nn.Sequential(*layers)   # keep same name as phase-2
 
-    ckpt_path = find_latest_epoch_ckpt(cfg.phase2_gate_ckpt_dir)
-    if ckpt_path is None:
-        raise FileNotFoundError(f"Cannot find Phase-2 gate ckpt in: {cfg.phase2_gate_ckpt_dir}")
+    def forward(self, x):
+        return torch.sigmoid(self.mlp(x))
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    if "gate_controller" in ckpt:
-        teacher.load_state_dict(ckpt["gate_controller"], strict=True)
-    else:
-        # fallback: maybe saved as raw state_dict
-        teacher.load_state_dict(ckpt, strict=True)
+def load_teacher(device: str) -> nn.Module:
+    ckpt = _pick_latest_file(cfg.phase2_gate_ckpt_dir)
+    sd = torch.load(ckpt, map_location="cpu")
+    sd = sd["gate_controller"] if "gate_controller" in sd else sd
 
-    teacher.eval()
-    for p in teacher.parameters():
+    idx = sorted(int(k.split(".")[1]) for k in sd if k.startswith("mlp.") and k.endswith("weight"))
+    if len(idx) == 0:
+        raise KeyError(
+            "[Teacher] Cannot find keys like 'mlp.{i}.weight' in checkpoint. "
+            "Please check the phase2 checkpoint format."
+        )
+
+    dims = [sd[f"mlp.{idx[0]}.weight"].shape[1]]
+    for i in idx:
+        dims.append(sd[f"mlp.{i}.weight"].shape[0])
+
+    net = GateTeacher(dims).to(device)
+    net.load_state_dict(sd, strict=True)
+    net.eval()
+    for p in net.parameters():
         p.requires_grad = False
 
-    print(f"[Teacher] Phase-2 gate loaded: {ckpt_path}")
-    return teacher
+    print("[Teacher] ckpt:", ckpt)
+    print("[Teacher] dims:", dims)
+    return net
 
+# ============================================================
+# Spatial Gate (M(x) → G_s)
+# ============================================================
 
-def set_requires_grad(m: nn.Module, req: bool):
-    for p in m.parameters():
-        p.requires_grad = req
+class SpatialGate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 8, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, 1),
+            nn.Sigmoid()
+        )
 
+    def forward(self, m: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+        g = F.interpolate(m, size=size, mode="bilinear", align_corners=False)
+        return self.conv(g)
 
 # ============================================================
 # Training
 # ============================================================
 
-def train_phase3_restore():
+def train():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("[Device]", device)
+
+    # ---- validate cache ----
+    if cfg.datasets_cfg is None:
+        cfg.datasets_cfg = {d: {} for d in os.listdir(cfg.cache_root) if os.path.isdir(os.path.join(cfg.cache_root, d))}
+        print("[Config] Auto-detected datasets:", list(cfg.datasets_cfg.keys()))
+
+    cfg.datasets_cfg = _validate_cache_root(cfg.cache_root, cfg.datasets_cfg, strict=cfg.strict_cache_check)
+    print("[Config] Using datasets:", list(cfg.datasets_cfg.keys()))
+
     _ensure_dir(cfg.save_root)
     _ensure_dir(cfg.results_root)
-    _ensure_dir(os.path.join(cfg.results_root, "logs"))
 
-    # log file
-    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(cfg.results_root, "logs", f"train_phase3_restore_{now}.txt")
-    tee = TeeLogger(log_path)
-    sys.stdout = tee
+    dataset = MultiTaskCLIPCacheDataset(
+        preload_cache_root=cfg.cache_root,
+        datasets=cfg.datasets_cfg,
+        crop_size=cfg.crop_size,
+        train=True,
+    )
+    loader = DataLoader(
+        dataset,
+        cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device == "cuda")
+    )
 
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print("[Phase3-Restore] Device:", device)
-        print("[Phase3-Restore] AMP:", cfg.use_amp)
-        print("[Phase3-Restore] freeze_backbone:", cfg.freeze_backbone)
-        print("[Phase3-Restore] freeze_degradation:", cfg.freeze_degradation)
-        print("[Phase3-Restore] freeze_translator:", cfg.freeze_translator)
-        print("[Phase3-Restore] lambda_g:", cfg.lambda_g)
+    sample_e = dataset[0]["e_img"]
+    clip_dim = int(sample_e.shape[-1]) if hasattr(sample_e, "shape") else int(sample_e.numel())
+    print("[Data] clip_dim:", clip_dim)
+    print("[Data] total items:", len(dataset))
 
-        # ---------------- Dataset ----------------
-        dataset = MultiTaskCLIPCacheDataset(
-            preload_cache_root=cfg.cache_root,
-            datasets=cfg.datasets_cfg,
-            crop_size=cfg.crop_size,
-            train=True,
-        )
-        print("[Phase3-Restore] Total items:", len(dataset))
+    backbone = VETNetBackbone(
+        in_channels=3, out_channels=3,
+        dim=64, num_blocks=(4,6,6,8),
+        heads=(1,2,4,8), volterra_rank=4,
+        ffn_expansion_factor=2.66,
+        bias=False,
+    ).to(device)
 
-        # infer clip dim safely
-        sample0 = dataset[0]
-        clip_dim = int(sample0["e_img"].numel())
-        print("[Phase3-Restore] CLIP dim:", clip_dim)
+    ckpt = torch.load(cfg.backbone_ckpt, map_location="cpu")
+    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    backbone.load_state_dict(sd, strict=True)
+    print("[Backbone] Loaded:", cfg.backbone_ckpt)
 
-        loader = DataLoader(
-            dataset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
+    degrader = DegradationEstimator().to(device)
 
-        # ---------------- Models ----------------
-        # backbone
-        backbone = VETNetBackbone(
-            in_channels=3, out_channels=3,
-            dim=64,
-            num_blocks=(4, 6, 6, 8),
-            heads=(1, 2, 4, 8),
-            volterra_rank=4,
-            ffn_expansion_factor=2.66,
-            bias=False,
-        ).to(device)
+    translator_cfg = ConditionTranslatorConfig(
+        clip_dim=clip_dim,
+        deg_dim=getattr(degrader, "out_dim", 5),
+        num_stages=cfg.num_stages,
+        enable_film=cfg.enable_film,
+        film_mode=cfg.film_mode,
+    )
+    translator = ConditionTranslator(translator_cfg).to(device)
 
-        load_backbone_ckpt(backbone, cfg.backbone_ckpt)
-        print("[Phase3-Restore] Backbone loaded:", cfg.backbone_ckpt)
+    spatial_gate = SpatialGate().to(device) if cfg.enable_spatial_gate else None
+    teacher = load_teacher(device)
 
-        # degradation estimator
-        degrader = DegradationEstimator().to(device)
+    # ---- optimizer: separate LR (backbone vs ctrl) ----
+    optim = torch.optim.AdamW(
+        [
+            {"params": backbone.parameters(), "lr": cfg.lr_backbone},
+            {"params": degrader.parameters(), "lr": cfg.lr_ctrl},
+            {"params": translator.parameters(), "lr": cfg.lr_ctrl},
+            *(([{"params": spatial_gate.parameters(), "lr": cfg.lr_ctrl}]) if spatial_gate is not None else []),
+        ],
+        weight_decay=cfg.weight_decay
+    )
 
-        # condition translator (outputs: film + gate)
-        # NOTE: must match your implementation signature
-        translator = ConditionTranslator(
-            clip_dim=clip_dim,
-            deg_dim=getattr(degrader, "out_dim", 8),  # fallback if your degrader exposes out_dim
-            num_stages=cfg.num_stages,
-        ).to(device)
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)
 
-        # teacher gate controller (phase2)
-        teacher_gate = build_teacher_gate_controller(clip_dim, cfg.num_stages, device)
+    if not _HAS_SKIMAGE:
+        print("[WARN] skimage not found -> PSNR/SSIM will be NaN. Install: pip install scikit-image")
+    if not _HAS_PIL:
+        print("[WARN] PIL/numpy not found -> preview images will not be saved.")
 
-        # freeze options
-        if cfg.freeze_backbone:
-            backbone.eval()
-            set_requires_grad(backbone, False)
-        else:
-            backbone.train()
-            set_requires_grad(backbone, True)
+    global_step = 0
+    for epoch in range(1, cfg.epochs + 1):
+        lam = ramp_lambda(epoch)
+        print(f"\n[Epoch {epoch:03d}/{cfg.epochs}] lambda_g={lam:.3f}  film={cfg.enable_film}({cfg.film_mode})  spatial={cfg.enable_spatial_gate}")
 
-        if cfg.freeze_degradation:
-            degrader.eval()
-            set_requires_grad(degrader, False)
-        else:
-            degrader.train()
-            set_requires_grad(degrader, True)
+        backbone.train()
+        degrader.train()
+        translator.train()
+        if spatial_gate is not None:
+            spatial_gate.train()
 
-        if cfg.freeze_translator:
-            translator.eval()
-            set_requires_grad(translator, False)
-        else:
-            translator.train()
-            set_requires_grad(translator, True)
+        # ---- epoch accumulators ----
+        loss_sum = 0.0
+        rec_sum = 0.0
+        g_sum = 0.0
 
-        # ---------------- Optimizer ----------------
-        params = []
-        if not cfg.freeze_backbone:
-            params += [{"params": backbone.parameters(), "lr": cfg.lr_backbone}]
-        if not cfg.freeze_degradation:
-            params += [{"params": degrader.parameters(), "lr": cfg.lr_controller}]
-        if not cfg.freeze_translator:
-            params += [{"params": translator.parameters(), "lr": cfg.lr_controller}]
+        psnr_sum = 0.0
+        ssim_sum = 0.0
+        n_img = 0
 
-        if len(params) == 0:
-            raise RuntimeError("No trainable parameters. Set at least one of freeze_* = False.")
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        for batch in pbar:
+            global_step += 1
 
-        optimizer = torch.optim.AdamW(params, weight_decay=cfg.weight_decay)
+            x = batch["input"].to(device, non_blocking=True)
+            y = batch["gt"].to(device, non_blocking=True)
+            e = batch["e_img"].to(device, non_blocking=True)
 
-        scaler = torch.cuda.amp.GradScaler(enabled=(cfg.use_amp and device == "cuda"))
+            optim.zero_grad(set_to_none=True)
 
-        # resume
-        start_epoch = try_resume_phase3(cfg.save_root, backbone, degrader, translator, optimizer, scaler)
-
-        # ---------------- Train Loop ----------------
-        global_step = 0
-
-        for epoch in range(start_epoch, cfg.epochs + 1):
-            t0 = time.time()
-
-            # set modes
-            if cfg.freeze_backbone:
-                backbone.eval()
-            else:
-                backbone.train()
-
-            if cfg.freeze_degradation:
-                degrader.eval()
-            else:
-                degrader.train()
-
-            if cfg.freeze_translator:
-                translator.eval()
-            else:
-                translator.train()
-
-            loss_sum = 0.0
-            rec_sum = 0.0
-            gdist_sum = 0.0
-            psnr_sum = 0.0
-            ssim_sum = 0.0
-            cnt = 0
-
-            # For quick gate monitoring
-            gate_mean_accum = torch.zeros(cfg.num_stages, dtype=torch.float64)
-            gate_count = 0
-
-            pbar = tqdm(loader, ncols=120, desc=f"Phase3 Epoch {epoch:03d}/{cfg.epochs}")
-
-            for batch in pbar:
-                global_step += 1
-                x = batch["input"].to(device, non_blocking=True)     # [B,3,H,W] in [0,1]
-                y = batch["gt"].to(device, non_blocking=True)        # [B,3,H,W]
-                e_clip = batch["e_img"].to(device, non_blocking=True)  # [B,D]
-
-                optimizer.zero_grad(set_to_none=True)
-
-                with torch.cuda.amp.autocast(enabled=(cfg.use_amp and device == "cuda")):
-                    # ---- Teacher (Phase-2 gate) ----
-                    with torch.no_grad():
-                        g_teacher = teacher_gate(e_clip)  # [B,8], already sigmoid/clamped by teacher model
-
-                    # ---- Student controller ----
-                    # degrader should return (M, v) or dict; we handle common cases robustly
-                    deg_out = degrader(x)
-                    if isinstance(deg_out, (tuple, list)) and len(deg_out) >= 2:
-                        M, v = deg_out[0], deg_out[1]
-                    elif isinstance(deg_out, dict):
-                        M = deg_out.get("map", None)
-                        v = deg_out.get("vec", None)
-                        if v is None:
-                            v = deg_out.get("v", None)
-                    else:
-                        # fallback: degrader returns only vector
-                        M, v = None, deg_out
-
-                    if v is None:
-                        raise RuntimeError("DegradationEstimator must provide a global severity vector v.")
-
-                    # translator should output (film, g_student) or dict
-                    tr_out = translator(e_clip, v)
-                    if isinstance(tr_out, (tuple, list)) and len(tr_out) >= 2:
-                        film, g_student = tr_out[0], tr_out[1]
-                    elif isinstance(tr_out, dict):
-                        film = tr_out.get("film", None)
-                        g_student = tr_out.get("g", None)
-                        if g_student is None:
-                            g_student = tr_out.get("g_stage", None)
-                    else:
-                        raise RuntimeError("ConditionTranslator must return (film, g_student) or dict with keys.")
-
-                    if g_student is None:
-                        raise RuntimeError("ConditionTranslator did not return g_student.")
-
-                    # ---- Restoration ----
-                    y_hat = backbone(x, g_stage=g_student, film=film)
-
-                    # ---- Loss (FIXED) ----
-                    L_rec = F.l1_loss(y_hat, y)
-                    L_gdist = torch.mean(torch.abs(g_student - g_teacher))
-                    loss = L_rec + cfg.lambda_g * L_gdist
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                # metrics (trend)
+            with torch.cuda.amp.autocast(enabled=cfg.use_amp):
                 with torch.no_grad():
-                    K = min(cfg.eval_images_per_batch, x.size(0))
-                    for i in range(K):
-                        psnr_sum += compute_psnr(y_hat[i].clamp(0, 1), y[i].clamp(0, 1))
-                        ssim_sum += compute_ssim_simple(y_hat[i].clamp(0, 1), y[i].clamp(0, 1))
+                    g_t = teacher(e)
 
-                    # gate stats
-                    g_cpu = g_student.detach().float().mean(dim=0).cpu()
-                    gate_mean_accum += g_cpu.double()
-                    gate_count += 1
+                deg = degrader(x)
+                M, v = deg if isinstance(deg, (tuple, list)) else (None, deg)
 
-                # accumulate
-                loss_sum += float(loss.item())
-                rec_sum += float(L_rec.item())
-                gdist_sum += float(L_gdist.item())
-                cnt += 1
+                out = translator(e, v)
+                g_s = out["g_stage"]
+                film = out.get("film", None)
 
-                denom = max(1, cnt * min(cfg.eval_images_per_batch, cfg.batch_size))
-                avg_loss = loss_sum / max(1, cnt)
-                avg_rec = rec_sum / max(1, cnt)
-                avg_gd = gdist_sum / max(1, cnt)
-                avg_psnr = psnr_sum / denom
-                avg_ssim = ssim_sum / denom
+                if cfg.enable_spatial_gate and (spatial_gate is not None) and (M is not None):
+                    G = spatial_gate(M[:, :1], x.shape[-2:])
+                else:
+                    G = None
 
-                pbar.set_postfix({
-                    "L": f"{avg_loss:.4f}",
-                    "Rec": f"{avg_rec:.4f}",
-                    "Gd": f"{avg_gd:.4f}",
-                    "P": f"{avg_psnr:.2f}",
-                    "S": f"{avg_ssim:.3f}",
-                })
+                y_hat = backbone(x, g_stage=g_s, film=film, spatial_gate=G)
 
-                if (global_step % cfg.log_every) == 0:
-                    gmean = (gate_mean_accum / max(1, gate_count)).numpy()
-                    print(f"[E{epoch:03d} step {global_step:06d}] "
-                          f"L={avg_loss:.4f} Rec={avg_rec:.4f} Gdist={avg_gd:.4f} "
-                          f"P={avg_psnr:.2f} S={avg_ssim:.3f} "
-                          f"g_mean={np.round(gmean, 4).tolist()}")
+                # metrics assume [0,1]
+                y_hat_01 = _to_01(y_hat)
+                y_01 = _to_01(y)
 
-            # ---- epoch done ----
-            denom = max(1, cnt * min(cfg.eval_images_per_batch, cfg.batch_size))
-            epoch_loss = loss_sum / max(1, cnt)
-            epoch_rec = rec_sum / max(1, cnt)
-            epoch_gd = gdist_sum / max(1, cnt)
-            epoch_psnr = psnr_sum / denom
-            epoch_ssim = ssim_sum / denom
+                L_rec = F.l1_loss(y_hat_01, y_01)
+                L_g = torch.mean(torch.abs(g_s - g_t))
+                loss = L_rec + lam * L_g
 
-            gmean_epoch = (gate_mean_accum / max(1, gate_count)).numpy()
-            elapsed = time.time() - t0
+            scaler.scale(loss).backward()
 
-            print("\n" + "=" * 90)
-            print(f"[Phase3][Epoch {epoch:03d}] time={elapsed/60:.1f}m  "
-                  f"L={epoch_loss:.4f} Rec={epoch_rec:.4f} Gdist={epoch_gd:.4f} "
-                  f"P={epoch_psnr:.2f} S={epoch_ssim:.3f}")
-            print(f"[Phase3][Epoch {epoch:03d}] g_mean={np.round(gmean_epoch, 4).tolist()}")
-            print("=" * 90)
+            if cfg.grad_clip is not None and cfg.grad_clip > 0:
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(
+                    list(backbone.parameters()) + list(degrader.parameters()) + list(translator.parameters()),
+                    cfg.grad_clip
+                )
+                if spatial_gate is not None:
+                    torch.nn.utils.clip_grad_norm_(spatial_gate.parameters(), cfg.grad_clip)
 
-            # ---- save ----
-            if (epoch % cfg.save_every_epochs) == 0:
-                ckpt_name = f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.3f}.pth"
-                ckpt_path = os.path.join(cfg.save_root, ckpt_name)
+            scaler.step(optim)
+            scaler.update()
 
-                extra = {
-                    "epoch_loss": epoch_loss,
-                    "epoch_rec": epoch_rec,
-                    "epoch_gdist": epoch_gd,
-                    "epoch_psnr": epoch_psnr,
-                    "epoch_ssim": epoch_ssim,
-                    "g_mean": np.round(gmean_epoch, 6).tolist(),
-                    "lambda_g": cfg.lambda_g,
-                    "freeze_backbone": cfg.freeze_backbone,
-                    "freeze_degradation": cfg.freeze_degradation,
-                    "freeze_translator": cfg.freeze_translator,
-                    "backbone_ckpt_init": cfg.backbone_ckpt,
-                    "phase2_gate_ckpt_dir": cfg.phase2_gate_ckpt_dir,
-                }
+            # ---- update accumulators ----
+            bs = int(x.size(0))
+            loss_sum += float(loss.item()) * bs
+            rec_sum += float(L_rec.item()) * bs
+            g_sum += float(L_g.item()) * bs
+            n_img += bs
 
-                save_phase3_ckpt(
-                    ckpt_path,
-                    epoch,
-                    backbone,
-                    degrader,
-                    translator,
-                    optimizer,
-                    scaler.state_dict() if (cfg.use_amp and device == "cuda") else None,
-                    extra
+            # batch psnr/ssim (costly -> do it with no_grad)
+            if _HAS_SKIMAGE:
+                with torch.no_grad():
+                    p_b, s_b = _calc_psnr_ssim_batch(y_hat_01, y_01)
+                psnr_sum += p_b * bs
+                ssim_sum += s_b * bs
+                psnr_now = p_b
+                ssim_now = s_b
+            else:
+                psnr_now = float("nan")
+                ssim_now = float("nan")
+
+            # ---- periodic preview saving ----
+            if (cfg.preview_every > 0) and (global_step % cfg.preview_every == 0):
+                if _HAS_PIL:
+                    save_dir = os.path.join(cfg.results_root, f"epoch_{epoch:03d}")
+                    tag = f"ep{epoch:03d}_it{global_step:07d}"
+                    save_path = os.path.join(save_dir, f"{tag}.png")
+                    title = (
+                        f"{tag}  "
+                        f"L={loss.item():.4f}  "
+                        f"Rec={L_rec.item():.4f}  "
+                        f"G={L_g.item():.4f}  "
+                        f"PSNR={psnr_now:.2f}  "
+                        f"SSIM={ssim_now:.4f}"
+                    )
+
+                    _save_triplet_side_by_side(_to_01(x), y_hat_01, y_01, save_path, title=title)
+
+            # ---- tqdm postfix ----
+            postfix = {
+                "L": f"{loss.item():.4f}",
+                "Rec": f"{L_rec.item():.4f}",
+                "G": f"{L_g.item():.4f}",
+            }
+            if _HAS_SKIMAGE:
+                postfix["P"] = f"{psnr_now:.2f}"
+                postfix["S"] = f"{ssim_now:.3f}"
+            pbar.set_postfix(postfix)
+
+            # ---- periodic console log ----
+            if (cfg.log_every > 0) and (global_step % cfg.log_every == 0):
+                p_avg = (psnr_sum / n_img) if (_HAS_SKIMAGE and n_img > 0) else float("nan")
+                s_avg = (ssim_sum / n_img) if (_HAS_SKIMAGE and n_img > 0) else float("nan")
+                print(
+                    f"[Iter {global_step:07d}] "
+                    f"L={loss_sum/n_img:.4f} Rec={rec_sum/n_img:.4f} G={g_sum/n_img:.4f} "
+                    f"PSNR={p_avg:.2f} SSIM={s_avg:.4f}"
                 )
 
-                print(f"[CKPT] Saved: {ckpt_path}")
+        # ---- epoch summary ----
+        loss_avg = loss_sum / max(1, n_img)
+        rec_avg = rec_sum / max(1, n_img)
+        g_avg = g_sum / max(1, n_img)
+        psnr_avg = (psnr_sum / n_img) if (_HAS_SKIMAGE and n_img > 0) else float("nan")
+        ssim_avg = (ssim_sum / n_img) if (_HAS_SKIMAGE and n_img > 0) else float("nan")
 
-        print("\n[FINISHED] Phase-3 restore training completed.")
+        print(
+            f"[Epoch {epoch:03d} End] "
+            f"L={loss_avg:.4f} Rec={rec_avg:.4f} G={g_avg:.4f} "
+            f"PSNR={psnr_avg:.2f} SSIM={ssim_avg:.4f}"
+        )
 
-    finally:
-        sys.stdout = tee._stdout
-        tee.close()
-        print(f"[LOG] Saved log to: {log_path}")
+        # ---- save per-epoch checkpoint (Phase-1 style filename) ----
+        save_name = (
+            f"epoch_{epoch:03d}_"
+            f"L{loss_avg:.4f}_"
+            f"P{psnr_avg:.2f}_"
+            f"S{ssim_avg:.4f}.pth"
+        )
+        save_path = os.path.join(cfg.save_root, save_name)
 
+        torch.save(
+            {
+                "epoch": epoch,
+                "global_step": global_step,
+                "cfg": cfg.__dict__,
+
+                "backbone": backbone.state_dict(),
+                "degrader": degrader.state_dict(),
+                "translator": translator.state_dict(),
+                "spatial_gate": (spatial_gate.state_dict() if spatial_gate is not None else None),
+
+                "optim": optim.state_dict(),
+                "scaler": scaler.state_dict(),
+
+                "epoch_metrics": {
+                    "loss": loss_avg,
+                    "rec": rec_avg,
+                    "gate": g_avg,
+                    "psnr": psnr_avg,
+                    "ssim": ssim_avg,
+                }
+            },
+            save_path
+        )
+        print("[CKPT] saved:", save_path)
+
+    print("[DONE] Phase-3 Final")
 
 if __name__ == "__main__":
-    train_phase3_restore()
+    train()
