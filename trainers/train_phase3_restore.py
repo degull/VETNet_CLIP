@@ -98,7 +98,7 @@ class Config:
 
     # ---- logging / preview ----
     log_every: int = 200            # print metrics every N iterations
-    preview_every: int = 500        # save (input|output|gt) every N iterations
+    preview_every: int = 100        # save (input|output|gt) every N iterations
     preview_max_items: int = 1      # number of samples per preview image (keep 1 to avoid too many files)
 
     # normalization assumption
