@@ -22,6 +22,8 @@
 # This module is "real code" (no placeholders), minimal dependencies.
 # ============================================================
 
+# one-shot MLP 정책 헤드
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -334,3 +336,146 @@ if __name__ == "__main__":
     print("g_stage:", out2["g_stage"].shape)
     print("film.gamma:", out2["film"]["gamma"].shape)
     print("film.beta :", out2["film"]["beta"].shape)
+
+
+# GRU-based autoregressive gate generator
+# ============================================================
+# Autoregressive Condition Translator
+#   T_AR(e_clip ⊕ v_deg) -> g_stage (sequential policy)
+# ============================================================
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# Config
+# ============================================================
+
+@dataclass
+class ConditionTranslatorConfig:
+    clip_dim: int = 768
+    deg_dim: int = 5
+    num_stages: int = 8
+
+    hidden_dim: int = 512
+    num_layers: int = 3
+    dropout: float = 0.0
+    use_layernorm: bool = True
+
+    gate_min: float = 0.0
+    gate_max: float = 1.0
+    gate_init_bias: float = 2.0   # sigmoid(2)=0.88
+
+    enable_film: bool = False     # (AR version: FiLM disabled by default)
+    film_mode: str = "stage_scalar"
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, num_layers,
+                 dropout=0.0, use_layernorm=True):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(d, hidden_dim))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            d = hidden_dim
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _clamp(x, lo, hi):
+    return x.clamp(lo, hi)
+
+
+# ============================================================
+# Autoregressive Condition Translator
+# ============================================================
+
+class ConditionTranslator(nn.Module):
+    """
+    Autoregressive Gate Policy:
+      g_1 -> g_2 -> ... -> g_T
+
+    Output interface is identical to the original:
+      out["g_stage"] : [B, T]
+    """
+
+    def __init__(self, cfg: Optional[ConditionTranslatorConfig] = None):
+        super().__init__()
+        self.cfg = cfg or ConditionTranslatorConfig()
+
+        self.num_stages = self.cfg.num_stages
+        in_dim = self.cfg.clip_dim + self.cfg.deg_dim
+
+        # Initial state encoder
+        self.encoder = MLP(
+            in_dim=in_dim,
+            hidden_dim=self.cfg.hidden_dim,
+            out_dim=self.cfg.hidden_dim,
+            num_layers=self.cfg.num_layers,
+            dropout=self.cfg.dropout,
+            use_layernorm=self.cfg.use_layernorm,
+        )
+
+        # AR core
+        self.gru = nn.GRUCell(
+            input_size=1,                 # previous g_t
+            hidden_size=self.cfg.hidden_dim
+        )
+
+        # Gate head (shared across steps)
+        self.gate_head = nn.Linear(self.cfg.hidden_dim, 1)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, self.cfg.gate_init_bias)
+
+    # ---------------------------------------------------------
+    # forward
+    # ---------------------------------------------------------
+    def forward(
+        self,
+        e_clip: torch.Tensor,   # [B, D]
+        v_deg: torch.Tensor     # [B, K]
+    ) -> Dict[str, Union[torch.Tensor, Dict]]:
+
+        B = e_clip.size(0)
+        x = torch.cat([e_clip, v_deg], dim=1)
+
+        # initial hidden state
+        h = self.encoder(x)     # [B, H]
+
+        g_list: List[torch.Tensor] = []
+
+        # initial previous gate (neutral start)
+        g_prev = torch.full((B, 1), 0.5, device=h.device)
+
+        for _ in range(self.num_stages):
+            # predict current gate
+            g_t = torch.sigmoid(self.gate_head(h))  # [B,1]
+            g_t = _clamp(g_t, self.cfg.gate_min, self.cfg.gate_max)
+            g_list.append(g_t)
+
+            # update hidden state autoregressively
+            h = self.gru(g_t, h)
+            g_prev = g_t
+
+        g_stage = torch.cat(g_list, dim=1)  # [B, T]
+
+        return {"g_stage": g_stage}
