@@ -1,4 +1,4 @@
-# E:/VETNet_CLIP/models/controller/condition_translator.py
+""" # E:/VETNet_CLIP/models/controller/condition_translator.py
 # ============================================================
 # Condition Translator T( e_clip ⊕ v_deg ) -> {g_stage, (optional) FiLM}
 #
@@ -116,20 +116,6 @@ def _clamp01(x: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
 # ============================================================
 
 class ConditionTranslator(nn.Module):
-    """
-    T( e_clip, v_deg ) -> dict:
-      {
-        "g_stage": [B, num_stages] in [gate_min, gate_max],
-        (optional)
-        "film": {
-           "gamma": ...,
-           "beta" : ...
-        }
-      }
-
-    - Phase-2: use only "g_stage"
-    - Phase-3: enable_film=True and consume "film" too
-    """
     def __init__(
         self,
         cfg: Optional[ConditionTranslatorConfig] = None,
@@ -214,11 +200,6 @@ class ConditionTranslator(nn.Module):
         e_clip: torch.Tensor,
         v_deg: torch.Tensor,
     ) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
-        """
-        Args:
-          e_clip: [B, D]
-          v_deg : [B, K]
-        """
         if e_clip.dim() != 2:
             raise ValueError(f"e_clip must be [B,D], got {tuple(e_clip.shape)}")
         if v_deg.dim() != 2:
@@ -280,13 +261,6 @@ class ConditionTranslator(nn.Module):
         gamma: torch.Tensor,
         beta: torch.Tensor
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Only used when film_mode == "stage_channel".
-        Converts:
-          gamma,beta: [B, sum(C_s)]
-        to list of per-stage:
-          [(gamma_s [B,C_s,1,1], beta_s [B,C_s,1,1]), ...]
-        """
         if not self.enable_film or self.film_mode != "stage_channel":
             raise RuntimeError("split_film_by_stage is only valid for enable_film=True & film_mode='stage_channel'")
         if self.stage_channels is None:
@@ -336,12 +310,16 @@ if __name__ == "__main__":
     print("g_stage:", out2["g_stage"].shape)
     print("film.gamma:", out2["film"]["gamma"].shape)
     print("film.beta :", out2["film"]["beta"].shape)
-
+ """
 
 # GRU-based autoregressive gate generator
 # ============================================================
 # Autoregressive Condition Translator
 #   T_AR(e_clip ⊕ v_deg) -> g_stage (sequential policy)
+# ============================================================
+
+# ============================================================
+# Autoregressive Condition Translator (FINAL, CLEAN)
 # ============================================================
 
 from __future__ import annotations
@@ -350,7 +328,6 @@ from typing import Dict, Optional, List, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ============================================================
@@ -359,20 +336,28 @@ import torch.nn.functional as F
 
 @dataclass
 class ConditionTranslatorConfig:
+    # ---- debug ----
+    debug_ar: bool = False          # AR 디버그 출력 on/off
+    debug_every: int = 200          # 몇 step마다 출력할지
+
+    # ---- input ----
     clip_dim: int = 768
     deg_dim: int = 5
     num_stages: int = 8
 
+    # ---- encoder ----
     hidden_dim: int = 512
     num_layers: int = 3
     dropout: float = 0.0
     use_layernorm: bool = True
 
+    # ---- gate ----
     gate_min: float = 0.0
     gate_max: float = 1.0
     gate_init_bias: float = 2.0   # sigmoid(2)=0.88
 
-    enable_film: bool = False     # (AR version: FiLM disabled by default)
+    # ---- film (unused here, interface compatibility) ----
+    enable_film: bool = False
     film_mode: str = "stage_scalar"
 
 
@@ -411,21 +396,28 @@ def _clamp(x, lo, hi):
 
 class ConditionTranslator(nn.Module):
     """
-    Autoregressive Gate Policy:
-      g_1 -> g_2 -> ... -> g_T
+    Autoregressive Gate Policy
 
-    Output interface is identical to the original:
-      out["g_stage"] : [B, T]
+    h0 = encoder(e ⊕ v)
+    for t = 1..T:
+        g_t = σ(W_g h_{t-1})
+        h_t = GRU(h_{t-1}, g_t)
+
+    Output:
+        out["g_stage"] : [B, T]
     """
 
     def __init__(self, cfg: Optional[ConditionTranslatorConfig] = None):
         super().__init__()
         self.cfg = cfg or ConditionTranslatorConfig()
+        self._dbg_step = 0
 
         self.num_stages = self.cfg.num_stages
         in_dim = self.cfg.clip_dim + self.cfg.deg_dim
 
-        # Initial state encoder
+        # --------------------------------------------------
+        # Initial state encoder: h0 = φ([e ⊕ v])
+        # --------------------------------------------------
         self.encoder = MLP(
             in_dim=in_dim,
             hidden_dim=self.cfg.hidden_dim,
@@ -435,20 +427,22 @@ class ConditionTranslator(nn.Module):
             use_layernorm=self.cfg.use_layernorm,
         )
 
+        # --------------------------------------------------
         # AR core
+        # --------------------------------------------------
         self.gru = nn.GRUCell(
-            input_size=1,                 # previous g_t
+            input_size=1,                  # gate g_t
             hidden_size=self.cfg.hidden_dim
         )
 
-        # Gate head (shared across steps)
+        # shared gate head
         self.gate_head = nn.Linear(self.cfg.hidden_dim, 1)
         nn.init.zeros_(self.gate_head.weight)
         nn.init.constant_(self.gate_head.bias, self.cfg.gate_init_bias)
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # forward
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     def forward(
         self,
         e_clip: torch.Tensor,   # [B, D]
@@ -458,24 +452,34 @@ class ConditionTranslator(nn.Module):
         B = e_clip.size(0)
         x = torch.cat([e_clip, v_deg], dim=1)
 
-        # initial hidden state
+        # h0
         h = self.encoder(x)     # [B, H]
 
         g_list: List[torch.Tensor] = []
 
-        # initial previous gate (neutral start)
-        g_prev = torch.full((B, 1), 0.5, device=h.device)
-
         for _ in range(self.num_stages):
-            # predict current gate
-            g_t = torch.sigmoid(self.gate_head(h))  # [B,1]
+            # g_t
+            g_t = torch.sigmoid(self.gate_head(h))   # [B,1]
             g_t = _clamp(g_t, self.cfg.gate_min, self.cfg.gate_max)
             g_list.append(g_t)
 
-            # update hidden state autoregressively
+            # h_t
             h = self.gru(g_t, h)
-            g_prev = g_t
 
         g_stage = torch.cat(g_list, dim=1)  # [B, T]
 
+        # --------------------------------------------------
+        # DEBUG (optional)
+        # --------------------------------------------------
+        self._dbg_step += 1
+        if self.cfg.debug_ar and (self._dbg_step % self.cfg.debug_every == 0):
+            g_mean = g_stage.mean(dim=0).detach().cpu().numpy()
+            diff = (g_stage[:, 1:] - g_stage[:, :-1]).abs().mean().item()
+            print(
+                f"[AR-DEBUG] step={self._dbg_step} | "
+                f"g_mean={g_mean} | "
+                f"mean|g_t-g_(t-1)|={diff:.4f}"
+            )
+
         return {"g_stage": g_stage}
+
